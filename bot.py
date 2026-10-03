@@ -98,16 +98,37 @@ async def rbx_login(s, login, password):
 async def rbx_login_2fa(s, csrf, ticket, code, media_type="Email"):
     """Подтверждение входа через 2FA код"""
     h = {**H, "X-CSRF-TOKEN": csrf}
+    # Roblox использует разные endpoint в зависимости от типа 2FA
+    payload = {"ticket": ticket, "code": code, "rememberDevice": False, "mediaType": media_type}
     async with s.post(
         "https://auth.roblox.com/v2/twostepverification/login",
-        json={"ticket": ticket, "code": code, "rememberDevice": False, "mediaType": media_type},
-        headers=h
+        json=payload, headers=h
     ) as r:
+        new_csrf = r.headers.get("x-csrf-token", csrf)
         if r.status == 200:
-            new_csrf = r.headers.get("x-csrf-token", csrf)
             return {"ok": True, "csrf": new_csrf}
-        b = await r.json(content_type=None)
-        return {"ok": False, "error": (b.get("errors") or [{}])[0].get("message", str(r.status))}
+        # Иногда нужен новый CSRF — повторяем
+        if r.status == 403:
+            h2 = {**H, "X-CSRF-TOKEN": new_csrf}
+            async with s.post(
+                "https://auth.roblox.com/v2/twostepverification/login",
+                json=payload, headers=h2
+            ) as r2:
+                new_csrf2 = r2.headers.get("x-csrf-token", new_csrf)
+                if r2.status == 200:
+                    return {"ok": True, "csrf": new_csrf2}
+                try:
+                    b = await r2.json(content_type=None)
+                    err = (b.get("errors") or [{}])[0].get("message", f"HTTP {r2.status}")
+                except:
+                    err = f"HTTP {r2.status}"
+                return {"ok": False, "error": err}
+        try:
+            b = await r.json(content_type=None)
+            err = (b.get("errors") or [{}])[0].get("message", f"HTTP {r.status}")
+        except:
+            err = f"HTTP {r.status}"
+        return {"ok": False, "error": err}
 
 async def rbx_change_password(s, csrf, cur, new):
     h = {**H, "X-CSRF-TOKEN": csrf}
@@ -634,13 +655,18 @@ async def bulk_run(message: Message, state: FSMContext):
 
                 # 2FA — ждём код от пользователя
                 if lg.get("need2fa"):
+                    saved_csrf      = lg["csrf"]
+                    saved_ticket    = lg.get("ticket", "")
+                    saved_mediatype = lg.get("mediaType", "Email")
                     code = await wait_for_2fa_code(msg, login)
                     if not code:
                         fail_list.append(f"❌ {login} — 2FA таймаут")
                         continue
-                    lg = await rbx_login_2fa(s, lg["csrf"], lg["ticket"], code, lg.get("mediaType","Email"))
+                    await msg.edit_text(f"⚡ [{i+1}/{len(lines)}] <code>{login}</code> — проверяем 2FA код...",
+                                        parse_mode="HTML")
+                    lg = await rbx_login_2fa(s, saved_csrf, saved_ticket, code, saved_mediatype)
                     if not lg["ok"]:
-                        fail_list.append(f"❌ {login} — неверный 2FA: {lg['error']}")
+                        fail_list.append(f"❌ {login} — неверный 2FA: {lg.get('error','нет ответа от Roblox')}")
                         continue
                     await msg.edit_text(f"⚡ [{i+1}/{len(lines)}] <code>{login}</code> — 2FA принят, продолжаем...",
                                         parse_mode="HTML")
