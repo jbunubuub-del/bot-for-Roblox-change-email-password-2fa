@@ -45,20 +45,20 @@ BH = {"Content-Type": "application/json", "User-Agent": UA}
 def hdr(csrf): return {"X-CSRF-TOKEN": csrf, **BH}
 
 def mk_session(roblosecurity: str = "") -> aiohttp.ClientSession:
-    """Сессия с cookie .ROBLOSECURITY — обходит капчу Roblox."""
-    jar = aiohttp.CookieJar(unsafe=True)
-    s   = aiohttp.ClientSession(cookie_jar=jar)
+    """Сессия с cookie .ROBLOSECURITY в заголовке — работает на всех субдоменах roblox.com"""
+    jar     = aiohttp.CookieJar(unsafe=True)
+    headers = {"User-Agent": UA, "Content-Type": "application/json"}
     if roblosecurity:
-        jar.update_cookies(
-            {"ROBLOSECURITY": roblosecurity.strip().lstrip("_|WARNING:-DO-NOT-SHARE-THIS.-")},
-            response_url=URL("https://www.roblox.com")
-        )
-    return s
+        # Берём cookie как есть — включая WARNING префикс, он часть значения
+        val = roblosecurity.strip()
+        headers["Cookie"] = f".ROBLOSECURITY={val}"
+        log.info(f"Cookie set, length={len(val)}, starts={val[:20]}...")
+    return aiohttp.ClientSession(cookie_jar=jar, headers=headers)
 
 async def get_csrf(s: aiohttp.ClientSession) -> str:
     """Получаем CSRF через logout — стандартный способ с cookie-сессией."""
     try:
-        async with s.post("https://auth.roblox.com/v2/logout", headers=BH) as r:
+        async with s.post("https://auth.roblox.com/v2/logout") as r:
             t = r.headers.get("x-csrf-token", "")
             log.info(f"get_csrf: status={r.status} token={'ok' if t else 'EMPTY'}")
             return t
@@ -69,16 +69,21 @@ async def get_csrf(s: aiohttp.ClientSession) -> str:
 async def rbx_check_auth(s: aiohttp.ClientSession) -> dict:
     """Проверяем что cookie рабочий — получаем имя пользователя."""
     try:
-        async with s.get("https://users.roblox.com/v1/users/authenticated",
-                         headers=BH) as r:
+        async with s.get("https://users.roblox.com/v1/users/authenticated") as r:
             try: body = await r.json(content_type=None)
             except: body = {}
             log.info(f"check_auth: status={r.status} body={body}")
-            if r.status == 200:
+            if r.status == 200 and body.get("id"):
                 return {"ok": True, "name": body.get("name", "?"), "id": body.get("id")}
-            return {"error": "Cookie недействителен или устарел"}
+            # Показываем точную причину
+            if r.status == 401:
+                return {"error": "Cookie недействителен или истёк — возьми свежий из браузера"}
+            if r.status == 403:
+                return {"error": f"Доступ запрещён (403) — возможно нужен другой cookie"}
+            return {"error": f"HTTP {r.status}: {body}"}
     except Exception as e:
-        return {"error": str(e)}
+        log.error(f"check_auth exception: {e}")
+        return {"error": f"Ошибка сети: {e}"}
 
 async def rbx_change_password(s: aiohttp.ClientSession, csrf: str, cur: str, new: str) -> dict:
     async with s.post(
@@ -142,8 +147,7 @@ async def rbx_disable_2fa(s: aiohttp.ClientSession, csrf: str) -> dict:
 
 async def rbx_get_2fa_status(s: aiohttp.ClientSession, user_id: int) -> dict:
     async with s.get(
-        f"https://twostepverification.roblox.com/v1/users/{user_id}/configuration",
-        headers=BH
+        f"https://twostepverification.roblox.com/v1/users/{user_id}/configuration"
     ) as r:
         try: body = await r.json(content_type=None)
         except: body = {}
