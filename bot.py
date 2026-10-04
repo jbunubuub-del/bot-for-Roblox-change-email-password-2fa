@@ -1,4 +1,5 @@
 import os, asyncio, aiohttp, logging
+from yarl import URL
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
@@ -15,135 +16,74 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 bot = Bot(token=TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
-# ── Глобальный future для /code в массовом режиме ─────────────────────────────
 _2fa_future: "asyncio.Future | None" = None
 
 # ── States ────────────────────────────────────────────────────────────────────
 class ChangePass(StatesGroup):
-    s_login = State(); s_cur = State(); s_new = State(); s_2fa = State()
+    s_cookie = State(); s_cur = State(); s_new = State(); s_2fa = State()
 
 class ForgotPass(StatesGroup):
     s_id = State()
 
 class ChangeEmail(StatesGroup):
-    s_login = State(); s_pass = State(); s_email = State(); s_2fa = State()
+    s_cookie = State(); s_pass = State(); s_email = State(); s_2fa = State()
 
 class Add2FA(StatesGroup):
-    s_login = State(); s_pass = State(); s_email = State()
-    s_login2fa = State()   # 2FA при входе
-    s_verify   = State()   # код подтверждения добавления почты
+    s_cookie = State(); s_pass = State(); s_email = State()
+    s_login2fa = State(); s_verify = State()
 
 class Del2FA(StatesGroup):
-    s_login = State(); s_pass = State(); s_2fa = State()
+    s_cookie = State(); s_pass = State(); s_2fa = State()
 
 class Bulk(StatesGroup):
     s_mode = State(); s_list = State()
 
 # ── Roblox API ────────────────────────────────────────────────────────────────
-UA  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-BH  = {"Content-Type": "application/json", "User-Agent": UA}
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+BH = {"Content-Type": "application/json", "User-Agent": UA}
 
-def mk_session():
-    """Создаём сессию с unsafe cookie jar (нужно для cross-domain roblox.com)"""
+def hdr(csrf): return {"X-CSRF-TOKEN": csrf, **BH}
+
+def mk_session(roblosecurity: str = "") -> aiohttp.ClientSession:
+    """Сессия с cookie .ROBLOSECURITY — обходит капчу Roblox."""
     jar = aiohttp.CookieJar(unsafe=True)
-    return aiohttp.ClientSession(cookie_jar=jar, headers=BH)
-
-def hdr(csrf): return {"X-CSRF-TOKEN": csrf}
+    s   = aiohttp.ClientSession(cookie_jar=jar)
+    if roblosecurity:
+        jar.update_cookies(
+            {"ROBLOSECURITY": roblosecurity.strip().lstrip("_|WARNING:-DO-NOT-SHARE-THIS.-")},
+            response_url=URL("https://www.roblox.com")
+        )
+    return s
 
 async def get_csrf(s: aiohttp.ClientSession) -> str:
+    """Получаем CSRF через logout — стандартный способ с cookie-сессией."""
     try:
-        async with s.post("https://auth.roblox.com/v2/login", json={}) as r:
-            return r.headers.get("x-csrf-token", "")
+        async with s.post("https://auth.roblox.com/v2/logout", headers=BH) as r:
+            t = r.headers.get("x-csrf-token", "")
+            log.info(f"get_csrf: status={r.status} token={'ok' if t else 'EMPTY'}")
+            return t
     except Exception as e:
         log.error(f"get_csrf error: {e}")
         return ""
 
-async def rbx_login(s: aiohttp.ClientSession, login: str, password: str) -> dict:
-    """
-    OK        → {"ok": True, "csrf": "..."}
-    2FA       → {"need2fa": True, "csrf": "...", "ticket": "...", "media": "Email"}
-    Error     → {"error": "message"}
-    """
-    csrf = await get_csrf(s)
-    async with s.post(
-        "https://auth.roblox.com/v2/login",
-        json={"ctype": "Username", "cvalue": login, "password": password},
-        headers=hdr(csrf)
-    ) as r:
-        new_csrf = r.headers.get("x-csrf-token", csrf)
-        try:
-            body = await r.json(content_type=None)
-        except Exception:
-            body = {}
-        log.info(f"login {login}: status={r.status} body={body}")
+async def rbx_check_auth(s: aiohttp.ClientSession) -> dict:
+    """Проверяем что cookie рабочий — получаем имя пользователя."""
+    try:
+        async with s.get("https://users.roblox.com/v1/users/authenticated",
+                         headers=BH) as r:
+            try: body = await r.json(content_type=None)
+            except: body = {}
+            log.info(f"check_auth: status={r.status} body={body}")
+            if r.status == 200:
+                return {"ok": True, "name": body.get("name", "?"), "id": body.get("id")}
+            return {"error": "Cookie недействителен или устарел"}
+    except Exception as e:
+        return {"error": str(e)}
 
-        if r.status == 200:
-            return {"ok": True, "csrf": new_csrf}
-
-        twofa = body.get("twoStepVerificationData") or {}
-        if twofa.get("ticket"):
-            return {
-                "need2fa": True,
-                "csrf":    new_csrf,
-                "ticket":  twofa["ticket"],
-                "media":   twofa.get("mediaType", "Email"),
-            }
-        errs = body.get("errors") or [{}]
-        msg  = errs[0].get("message") or f"HTTP {r.status}"
-        return {"error": msg}
-
-async def rbx_verify2fa(s: aiohttp.ClientSession, csrf: str,
-                         ticket: str, code: str, media: str = "Email") -> dict:
-    """Подтверждение 2FA. После успеха сессия s имеет ROBLOSECURITY."""
-    payload = {"ticket": ticket, "code": code, "rememberDevice": False, "mediaType": media}
-    log.info(f"verify2fa: ticket={ticket[:20]}... code={code} media={media}")
-
-    # Попытка 1
-    async with s.post(
-        "https://auth.roblox.com/v2/twostepverification/login",
-        json=payload, headers=hdr(csrf)
-    ) as r:
-        new_csrf = r.headers.get("x-csrf-token", csrf)
-        try:
-            body = await r.json(content_type=None)
-        except Exception:
-            body = {}
-        log.info(f"verify2fa attempt1: status={r.status} body={body}")
-
-        if r.status == 200:
-            return {"ok": True, "csrf": new_csrf}
-
-        if r.status != 403:
-            errs = body.get("errors") or [{}]
-            return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
-
-        # 403 → обновляем csrf и повторяем
-        csrf = new_csrf
-
-    # Попытка 2 с новым CSRF
-    async with s.post(
-        "https://auth.roblox.com/v2/twostepverification/login",
-        json=payload, headers=hdr(csrf)
-    ) as r:
-        new_csrf = r.headers.get("x-csrf-token", csrf)
-        try:
-            body = await r.json(content_type=None)
-        except Exception:
-            body = {}
-        log.info(f"verify2fa attempt2: status={r.status} body={body}")
-
-        if r.status == 200:
-            return {"ok": True, "csrf": new_csrf}
-
-        errs = body.get("errors") or [{}]
-        return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
-
-async def rbx_change_password(s: aiohttp.ClientSession,
-                               csrf: str, cur: str, new: str) -> dict:
+async def rbx_change_password(s: aiohttp.ClientSession, csrf: str, cur: str, new: str) -> dict:
     async with s.post(
         "https://auth.roblox.com/v2/user/passwords/change",
-        json={"currentPassword": cur, "newPassword": new},
-        headers=hdr(csrf)
+        json={"currentPassword": cur, "newPassword": new}, headers=hdr(csrf)
     ) as r:
         try: body = await r.json(content_type=None)
         except: body = {}
@@ -152,12 +92,10 @@ async def rbx_change_password(s: aiohttp.ClientSession,
         errs = body.get("errors") or [{}]
         return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
 
-async def rbx_change_email(s: aiohttp.ClientSession,
-                            csrf: str, email: str, password: str) -> dict:
+async def rbx_change_email(s: aiohttp.ClientSession, csrf: str, email: str, password: str) -> dict:
     async with s.patch(
         "https://accountsettings.roblox.com/v1/email",
-        json={"emailAddress": email, "password": password},
-        headers=hdr(csrf)
+        json={"emailAddress": email, "password": password}, headers=hdr(csrf)
     ) as r:
         try: body = await r.json(content_type=None)
         except: body = {}
@@ -202,6 +140,17 @@ async def rbx_disable_2fa(s: aiohttp.ClientSession, csrf: str) -> dict:
         errs = body.get("errors") or [{}]
         return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
 
+async def rbx_get_2fa_status(s: aiohttp.ClientSession, user_id: int) -> dict:
+    async with s.get(
+        f"https://twostepverification.roblox.com/v1/users/{user_id}/configuration",
+        headers=BH
+    ) as r:
+        try: body = await r.json(content_type=None)
+        except: body = {}
+        log.info(f"2fa_status: status={r.status} body={body}")
+        if r.status == 200: return {"ok": True, "data": body}
+        return {"error": f"HTTP {r.status}"}
+
 async def rbx_forgot_password(s: aiohttp.ClientSession, identifier: str) -> dict:
     csrf = await get_csrf(s)
     t = "Email" if "@" in identifier else "Username"
@@ -220,6 +169,16 @@ async def rbx_forgot_password(s: aiohttp.ClientSession, identifier: str) -> dict
 def g(m): return m.from_user.id == OWNER_ID
 def is_ok(r): return r.get("ok") is True
 def errmsg(r): return r.get("error") or "Неизвестная ошибка"
+
+COOKIE_HELP = (
+    "🍪 <b>Как получить .ROBLOSECURITY cookie:</b>\n\n"
+    "1. Открой <b>roblox.com</b> в браузере\n"
+    "2. Войди в аккаунт\n"
+    "3. Нажми <b>F12</b> → вкладка <b>Application</b> (Chrome) или <b>Storage</b> (Firefox)\n"
+    "4. Слева: <b>Cookies</b> → <b>https://www.roblox.com</b>\n"
+    "5. Найди <b>.ROBLOSECURITY</b> → скопируй значение (Value)\n\n"
+    "Вставь сюда скопированное значение:"
+)
 
 def menu():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -246,8 +205,13 @@ def ckb():
 async def cmd_start(m: Message, state: FSMContext):
     if not g(m): return
     await state.clear()
-    await m.answer("👾 <b>Roblox Account Changer</b>\n\nВыбери действие:",
-                   reply_markup=menu(), parse_mode="HTML")
+    await m.answer(
+        "👾 <b>Roblox Account Changer</b>\n\n"
+        "⚠️ Теперь вместо логина/пароля используется <b>.ROBLOSECURITY cookie</b> — "
+        "это обходит капчу Roblox.\n\n"
+        "Выбери действие:",
+        reply_markup=menu(), parse_mode="HTML"
+    )
 
 @dp.message(Command("code"))
 async def cmd_code(m: Message):
@@ -269,83 +233,50 @@ async def on_cancel(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("Отменено.", reply_markup=menu())
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  🔑 СМЕНА ПАРОЛЯ
+#  🔑 СМЕНА ПАРОЛЯ   (cookie → текущий пароль → новый пароль)
 # ══════════════════════════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_pass")
 async def pass_start(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(ChangePass.s_login)
-    await cb.message.edit_text("🔑 <b>Смена пароля</b>\n\nЛогин:", parse_mode="HTML", reply_markup=ckb())
+    await state.set_state(ChangePass.s_cookie)
+    await cb.message.edit_text(COOKIE_HELP, parse_mode="HTML", reply_markup=ckb())
 
-@dp.message(ChangePass.s_login)
-async def pass_l(m: Message, state: FSMContext):
+@dp.message(ChangePass.s_cookie)
+async def pass_cookie(m: Message, state: FSMContext):
     if not g(m): return
-    await state.update_data(login=m.text.strip())
+    cookie = m.text.strip()
+    msg = await m.answer("⏳ Проверяем cookie...")
+    s   = mk_session(cookie)
+    auth = await rbx_check_auth(s)
+    await s.close()
+    if "error" in auth:
+        await msg.edit_text(f"❌ {errmsg(auth)}\n\n{COOKIE_HELP}",
+                            parse_mode="HTML", reply_markup=ckb()); return
+    await state.update_data(cookie=cookie)
     await state.set_state(ChangePass.s_cur)
-    await m.answer("Текущий пароль:", reply_markup=ckb())
+    await msg.edit_text(f"✅ Аккаунт: <b>{auth['name']}</b>\n\nТекущий пароль:",
+                        parse_mode="HTML", reply_markup=ckb())
 
 @dp.message(ChangePass.s_cur)
-async def pass_c(m: Message, state: FSMContext):
+async def pass_cur(m: Message, state: FSMContext):
     if not g(m): return
     await state.update_data(cur=m.text.strip())
     await state.set_state(ChangePass.s_new)
     await m.answer("Новый пароль (мин. 8 симв.):", reply_markup=ckb())
 
 @dp.message(ChangePass.s_new)
-async def pass_n(m: Message, state: FSMContext):
+async def pass_new(m: Message, state: FSMContext):
     if not g(m): return
     new = m.text.strip()
     if len(new) < 8:
         await m.answer("❌ Минимум 8 символов!"); return
-    await state.update_data(new=new)
     d   = await state.get_data()
-    msg = await m.answer("⏳ Входим...")
-
-    s = mk_session()
-    lg = await rbx_login(s, d["login"], d["cur"])
-
-    if lg.get("need2fa"):
-        await state.update_data(csrf=lg["csrf"], ticket=lg["ticket"], media=lg["media"])
-        await state.set_state(ChangePass.s_2fa)
-        # НЕ закрываем сессию — кладём в state (нельзя, сессия не сериализуется)
-        # Закрываем здесь, в pass_2fa откроем новую — это OK для 2FA verify
-        await s.close()
-        await msg.edit_text(
-            f"🔐 2FA ({lg['media']}) — Roblox уже отправил код на привязанную почту/приложение\n\n"
-            f"Введи 6-значный код:", reply_markup=ckb())
-        return
-
-    if "error" in lg:
-        await s.close(); await state.clear()
-        await msg.edit_text(f"❌ Ошибка входа: <code>{errmsg(lg)}</code>",
-                            parse_mode="HTML", reply_markup=menu()); return
-
-    r = await rbx_change_password(s, lg["csrf"], d["cur"], new)
+    msg = await m.answer("⏳ Меняем пароль...")
+    s   = mk_session(d["cookie"])
+    csrf = await get_csrf(s)
+    r    = await rbx_change_password(s, csrf, d["cur"], new)
     await s.close(); await state.clear()
     if is_ok(r):
-        await msg.edit_text(f"✅ <b>Пароль изменён!</b>\n👤 <code>{d['login']}</code>\n🔑 <code>{new}</code>",
-                            parse_mode="HTML", reply_markup=menu())
-    else:
-        await msg.edit_text(f"❌ {errmsg(r)}", reply_markup=menu())
-
-@dp.message(ChangePass.s_2fa)
-async def pass_2fa(m: Message, state: FSMContext):
-    if not g(m): return
-    code = m.text.strip()
-    d    = await state.get_data()
-    msg  = await m.answer("⏳ Проверяем 2FA...")
-
-    # Открываем НОВУЮ сессию — verify2fa установит cookie, затем меняем пароль
-    s   = mk_session()
-    lg2 = await rbx_verify2fa(s, d["csrf"], d["ticket"], code, d.get("media","Email"))
-    if "error" in lg2:
-        await s.close(); await state.clear()
-        await msg.edit_text(f"❌ Неверный 2FA код: <code>{errmsg(lg2)}</code>",
-                            parse_mode="HTML", reply_markup=menu()); return
-
-    r = await rbx_change_password(s, lg2["csrf"], d["cur"], d["new"])
-    await s.close(); await state.clear()
-    if is_ok(r):
-        await msg.edit_text(f"✅ <b>Пароль изменён!</b>\n👤 <code>{d['login']}</code>",
+        await msg.edit_text(f"✅ <b>Пароль изменён!</b>\n🔑 Новый: <code>{new}</code>",
                             parse_mode="HTML", reply_markup=menu())
     else:
         await msg.edit_text(f"❌ {errmsg(r)}", reply_markup=menu())
@@ -375,173 +306,104 @@ async def forgot_run(m: Message, state: FSMContext):
         await msg.edit_text(f"⚠️ {errmsg(r)}\n\nВручную:\n{link}", reply_markup=menu())
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  📧 СМЕНА ПОЧТЫ
+#  📧 СМЕНА ПОЧТЫ   (cookie → пароль → новая почта)
 # ══════════════════════════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_email")
 async def email_start(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(ChangeEmail.s_login)
-    await cb.message.edit_text("📧 <b>Смена почты</b>\n\nЛогин:", parse_mode="HTML", reply_markup=ckb())
+    await state.set_state(ChangeEmail.s_cookie)
+    await cb.message.edit_text(COOKIE_HELP, parse_mode="HTML", reply_markup=ckb())
 
-@dp.message(ChangeEmail.s_login)
-async def email_l(m: Message, state: FSMContext):
+@dp.message(ChangeEmail.s_cookie)
+async def email_cookie(m: Message, state: FSMContext):
     if not g(m): return
-    await state.update_data(login=m.text.strip())
+    cookie = m.text.strip()
+    msg = await m.answer("⏳ Проверяем cookie...")
+    s   = mk_session(cookie)
+    auth = await rbx_check_auth(s)
+    await s.close()
+    if "error" in auth:
+        await msg.edit_text(f"❌ {errmsg(auth)}\n\n{COOKIE_HELP}",
+                            parse_mode="HTML", reply_markup=ckb()); return
+    await state.update_data(cookie=cookie)
     await state.set_state(ChangeEmail.s_pass)
-    await m.answer("Пароль:", reply_markup=ckb())
+    await msg.edit_text(f"✅ Аккаунт: <b>{auth['name']}</b>\n\nПароль аккаунта:",
+                        parse_mode="HTML", reply_markup=ckb())
 
 @dp.message(ChangeEmail.s_pass)
-async def email_p(m: Message, state: FSMContext):
+async def email_pass(m: Message, state: FSMContext):
     if not g(m): return
     await state.update_data(password=m.text.strip())
     await state.set_state(ChangeEmail.s_email)
-    await m.answer("Новая почта:", reply_markup=ckb())
+    await m.answer("📧 Новая почта:", reply_markup=ckb())
 
 @dp.message(ChangeEmail.s_email)
-async def email_e(m: Message, state: FSMContext):
+async def email_new(m: Message, state: FSMContext):
     if not g(m): return
     new_email = m.text.strip()
-    await state.update_data(new_email=new_email)
-    d   = await state.get_data()
-    msg = await m.answer("⏳ Входим...")
-
-    s  = mk_session()
-    lg = await rbx_login(s, d["login"], d["password"])
-
-    if lg.get("need2fa"):
-        await state.update_data(csrf=lg["csrf"], ticket=lg["ticket"], media=lg["media"])
-        await state.set_state(ChangeEmail.s_2fa)
-        await s.close()
-        await msg.edit_text(
-            f"🔐 2FA ({lg['media']}) — введи 6-значный код:", reply_markup=ckb())
-        return
-
-    if "error" in lg:
-        await s.close(); await state.clear()
-        await msg.edit_text(f"❌ {errmsg(lg)}", reply_markup=menu()); return
-
-    r = await rbx_change_email(s, lg["csrf"], new_email, d["password"])
-    await s.close(); await state.clear()
-    if is_ok(r):
-        await msg.edit_text(f"✅ <b>Почта изменена!</b>\n👤 <code>{d['login']}</code>\n📧 <code>{new_email}</code>",
-                            parse_mode="HTML", reply_markup=menu())
-    else:
-        await msg.edit_text(f"❌ {errmsg(r)}", reply_markup=menu())
-
-@dp.message(ChangeEmail.s_2fa)
-async def email_2fa(m: Message, state: FSMContext):
-    if not g(m): return
-    code = m.text.strip()
     d    = await state.get_data()
-    msg  = await m.answer("⏳ Проверяем 2FA...")
-
-    s   = mk_session()
-    lg2 = await rbx_verify2fa(s, d["csrf"], d["ticket"], code, d.get("media","Email"))
-    if "error" in lg2:
-        await s.close(); await state.clear()
-        await msg.edit_text(f"❌ Неверный 2FA: <code>{errmsg(lg2)}</code>",
-                            parse_mode="HTML", reply_markup=menu()); return
-
-    r = await rbx_change_email(s, lg2["csrf"], d["new_email"], d["password"])
+    msg  = await m.answer("⏳ Меняем почту...")
+    s    = mk_session(d["cookie"])
+    csrf = await get_csrf(s)
+    r    = await rbx_change_email(s, csrf, new_email, d["password"])
     await s.close(); await state.clear()
     if is_ok(r):
-        await msg.edit_text(f"✅ <b>Почта изменена!</b>\n📧 <code>{d['new_email']}</code>",
+        await msg.edit_text(f"✅ <b>Почта изменена!</b>\n📧 <code>{new_email}</code>",
                             parse_mode="HTML", reply_markup=menu())
     else:
         await msg.edit_text(f"❌ {errmsg(r)}", reply_markup=menu())
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  🔐 ДОБАВИТЬ 2FA
+#  🔐 ДОБАВИТЬ 2FA   (cookie → пароль → почта 2FA → код с почты)
 # ══════════════════════════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_2fa_add")
 async def add2fa_start(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Add2FA.s_login)
-    await cb.message.edit_text("🔐 <b>Добавление 2FA почты</b>\n\nЛогин:",
-                                parse_mode="HTML", reply_markup=ckb())
+    await state.set_state(Add2FA.s_cookie)
+    await cb.message.edit_text(COOKIE_HELP, parse_mode="HTML", reply_markup=ckb())
 
-@dp.message(Add2FA.s_login)
-async def a2_l(m: Message, state: FSMContext):
+@dp.message(Add2FA.s_cookie)
+async def a2_cookie(m: Message, state: FSMContext):
     if not g(m): return
-    await state.update_data(login=m.text.strip())
-    await state.set_state(Add2FA.s_pass)
-    await m.answer("Пароль:", reply_markup=ckb())
-
-@dp.message(Add2FA.s_pass)
-async def a2_p(m: Message, state: FSMContext):
-    if not g(m): return
-    await state.update_data(password=m.text.strip())
+    cookie = m.text.strip()
+    msg = await m.answer("⏳ Проверяем cookie...")
+    s   = mk_session(cookie)
+    auth = await rbx_check_auth(s)
+    await s.close()
+    if "error" in auth:
+        await msg.edit_text(f"❌ {errmsg(auth)}\n\n{COOKIE_HELP}",
+                            parse_mode="HTML", reply_markup=ckb()); return
+    await state.update_data(cookie=cookie, username=auth["name"])
     await state.set_state(Add2FA.s_email)
-    await m.answer("📧 Почта для добавления в 2FA:", reply_markup=ckb())
+    await msg.edit_text(f"✅ Аккаунт: <b>{auth['name']}</b>\n\n📧 Почта для добавления в 2FA:",
+                        parse_mode="HTML", reply_markup=ckb())
 
 @dp.message(Add2FA.s_email)
-async def a2_e(m: Message, state: FSMContext):
+async def a2_email(m: Message, state: FSMContext):
     if not g(m): return
     fa_email = m.text.strip()
     await state.update_data(fa_email=fa_email)
-    d   = await state.get_data()
-    msg = await m.answer("⏳ Входим...")
-
-    s  = mk_session()
-    lg = await rbx_login(s, d["login"], d["password"])
-
-    if lg.get("need2fa"):
-        await state.update_data(csrf=lg["csrf"], ticket=lg["ticket"], media=lg["media"])
-        await state.set_state(Add2FA.s_login2fa)
-        await s.close()
-        await msg.edit_text(f"🔐 Нужен текущий 2FA код ({lg['media']}):\n\nВведи код:", reply_markup=ckb())
-        return
-
-    if "error" in lg:
-        await s.close(); await state.clear()
-        await msg.edit_text(f"❌ {errmsg(lg)}", reply_markup=menu()); return
-
-    # Вошли — добавляем 2FA почту
-    r = await rbx_add_2fa_email(s, lg["csrf"], fa_email)
-    await state.update_data(csrf=lg["csrf"])
-    await s.close()
-    if "error" in r:
-        await state.clear()
-        await msg.edit_text(f"❌ {errmsg(r)}", reply_markup=menu()); return
-
-    await state.set_state(Add2FA.s_verify)
-    await msg.edit_text(f"📨 Код отправлен на <code>{fa_email}</code>\n\nВведи код подтверждения:",
-                        parse_mode="HTML", reply_markup=ckb())
-
-@dp.message(Add2FA.s_login2fa)
-async def a2_login2fa(m: Message, state: FSMContext):
-    """2FA при входе — потом добавляем 2FA почту"""
-    if not g(m): return
-    code = m.text.strip()
     d    = await state.get_data()
-    msg  = await m.answer("⏳ Проверяем 2FA входа...")
-
-    s   = mk_session()
-    lg2 = await rbx_verify2fa(s, d["csrf"], d["ticket"], code, d.get("media","Email"))
-    if "error" in lg2:
-        await s.close(); await state.clear()
-        await msg.edit_text(f"❌ Неверный 2FA: <code>{errmsg(lg2)}</code>",
-                            parse_mode="HTML", reply_markup=menu()); return
-
-    r = await rbx_add_2fa_email(s, lg2["csrf"], d["fa_email"])
-    await state.update_data(csrf=lg2["csrf"])
+    msg  = await m.answer("⏳ Добавляем 2FA почту...")
+    s    = mk_session(d["cookie"])
+    csrf = await get_csrf(s)
+    r    = await rbx_add_2fa_email(s, csrf, fa_email)
+    await state.update_data(csrf=csrf)
     await s.close()
     if "error" in r:
         await state.clear()
         await msg.edit_text(f"❌ {errmsg(r)}", reply_markup=menu()); return
-
     await state.set_state(Add2FA.s_verify)
-    await msg.edit_text(f"📨 Код отправлен на <code>{d['fa_email']}</code>\n\nВведи код подтверждения:",
-                        parse_mode="HTML", reply_markup=ckb())
+    await msg.edit_text(
+        f"📨 Код отправлен на <code>{fa_email}</code>\n\nВведи 6-значный код подтверждения:",
+        parse_mode="HTML", reply_markup=ckb())
 
 @dp.message(Add2FA.s_verify)
 async def a2_verify(m: Message, state: FSMContext):
-    """Подтверждение кода для добавления 2FA почты"""
     if not g(m): return
     code = m.text.strip()
     d    = await state.get_data()
     msg  = await m.answer("⏳ Подтверждаем...")
-
-    s = mk_session()
-    r = await rbx_verify_2fa_email(s, d["csrf"], code)
+    s    = mk_session(d["cookie"])
+    r    = await rbx_verify_2fa_email(s, d["csrf"], code)
     await s.close(); await state.clear()
     if is_ok(r):
         await msg.edit_text(f"✅ <b>2FA добавлена!</b>\n📧 <code>{d['fa_email']}</code>",
@@ -550,73 +412,42 @@ async def a2_verify(m: Message, state: FSMContext):
         await msg.edit_text(f"❌ {errmsg(r)}", reply_markup=menu())
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  🗑 УБРАТЬ 2FA
+#  🗑 УБРАТЬ 2FA   (cookie)
 # ══════════════════════════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_2fa_del")
 async def del2fa_start(cb: CallbackQuery, state: FSMContext):
-    await state.set_state(Del2FA.s_login)
-    await cb.message.edit_text("🗑 <b>Отключение 2FA</b>\n\nЛогин:", parse_mode="HTML", reply_markup=ckb())
+    await state.set_state(Del2FA.s_cookie)
+    await cb.message.edit_text(COOKIE_HELP, parse_mode="HTML", reply_markup=ckb())
 
-@dp.message(Del2FA.s_login)
-async def d2_l(m: Message, state: FSMContext):
+@dp.message(Del2FA.s_cookie)
+async def d2_cookie(m: Message, state: FSMContext):
     if not g(m): return
-    await state.update_data(login=m.text.strip())
-    await state.set_state(Del2FA.s_pass)
-    await m.answer("Пароль:", reply_markup=ckb())
-
-@dp.message(Del2FA.s_pass)
-async def d2_p(m: Message, state: FSMContext):
-    if not g(m): return
-    password = m.text.strip()
-    d   = await state.get_data()
-    msg = await m.answer("⏳ Входим...")
-
-    s  = mk_session()
-    lg = await rbx_login(s, d["login"], password)
-
-    if lg.get("need2fa"):
-        await state.update_data(password=password, csrf=lg["csrf"],
-                                ticket=lg["ticket"], media=lg["media"])
-        await state.set_state(Del2FA.s_2fa)
-        await s.close()
-        await msg.edit_text(f"🔐 Нужен 2FA код ({lg['media']}):\n\nВведи код:", reply_markup=ckb())
-        return
-
-    if "error" in lg:
-        await s.close(); await state.clear()
-        await msg.edit_text(f"❌ {errmsg(lg)}", reply_markup=menu()); return
-
-    r = await rbx_disable_2fa(s, lg["csrf"])
+    cookie = m.text.strip()
+    msg = await m.answer("⏳ Проверяем cookie...")
+    s   = mk_session(cookie)
+    auth = await rbx_check_auth(s)
+    await s.close()
+    if "error" in auth:
+        await msg.edit_text(f"❌ {errmsg(auth)}\n\n{COOKIE_HELP}",
+                            parse_mode="HTML", reply_markup=ckb()); return
+    await state.update_data(cookie=cookie)
+    msg2 = await msg.edit_text(f"✅ Аккаунт: <b>{auth['name']}</b>\n\n⏳ Отключаем 2FA...",
+                               parse_mode="HTML")
+    s    = mk_session(cookie)
+    csrf = await get_csrf(s)
+    r    = await rbx_disable_2fa(s, csrf)
     await s.close(); await state.clear()
     if is_ok(r):
-        await msg.edit_text(f"✅ <b>2FA отключена!</b>\n👤 <code>{d['login']}</code>",
-                            parse_mode="HTML", reply_markup=menu())
+        await msg2.edit_text(f"✅ <b>2FA отключена!</b>\n👤 <code>{auth['name']}</code>",
+                             parse_mode="HTML", reply_markup=menu())
     else:
-        await msg.edit_text(f"❌ {errmsg(r)}", reply_markup=menu())
-
-@dp.message(Del2FA.s_2fa)
-async def d2_2fa(m: Message, state: FSMContext):
-    if not g(m): return
-    code = m.text.strip()
-    d    = await state.get_data()
-    msg  = await m.answer("⏳ Проверяем 2FA и отключаем...")
-
-    s   = mk_session()
-    lg2 = await rbx_verify2fa(s, d["csrf"], d["ticket"], code, d.get("media","Email"))
-    if "error" in lg2:
-        await s.close(); await state.clear()
-        await msg.edit_text(f"❌ Неверный 2FA: <code>{errmsg(lg2)}</code>",
-                            parse_mode="HTML", reply_markup=menu()); return
-
-    r = await rbx_disable_2fa(s, lg2["csrf"])
-    await s.close(); await state.clear()
-    if is_ok(r):
-        await msg.edit_text("✅ <b>2FA отключена!</b>", parse_mode="HTML", reply_markup=menu())
-    else:
-        await msg.edit_text(f"❌ {errmsg(r)}", reply_markup=menu())
+        await msg2.edit_text(f"❌ {errmsg(r)}", reply_markup=menu())
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ⚡ МАССОВАЯ СМЕНА
+#  Формат: ROBLOSECURITY:пароль:новый_пароль
+#          ROBLOSECURITY:пароль:новая_почта
+#          ROBLOSECURITY:пароль:новый_пароль:новая_почта
 # ══════════════════════════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_bulk")
 async def bulk_start(cb: CallbackQuery, state: FSMContext):
@@ -628,13 +459,18 @@ async def bulk_mode_cb(cb: CallbackQuery, state: FSMContext):
     mode = cb.data[2:]
     await state.update_data(mode=mode)
     await state.set_state(Bulk.s_list)
-    fmt = {"pass": "логин:пароль:новый_пароль",
-           "email": "логин:пароль:новая_почта",
-           "both":  "логин:пароль:новый_пароль:новая_почта"}
+    fmt = {
+        "pass":  "ROBLOSECURITY:текущий_пароль:новый_пароль",
+        "email": "ROBLOSECURITY:пароль:новая_почта",
+        "both":  "ROBLOSECURITY:пароль:новый_пароль:новая_почта",
+    }
     lbl = {"pass": "Пароль", "email": "Почта", "both": "Пароль + Почта"}
     await cb.message.edit_text(
-        f"⚡ Режим: <b>{lbl[mode]}</b>\n\nФормат:\n<code>{fmt[mode]}</code>\n\n"
-        f"При 2FA — бот остановится, пиши <code>/code XXXXXX</code>",
+        f"⚡ Режим: <b>{lbl[mode]}</b>\n\n"
+        f"Формат (каждый аккаунт с новой строки):\n"
+        f"<code>{fmt[mode]}</code>\n\n"
+        f"ROBLOSECURITY = cookie из браузера\n"
+        f"При 2FA — пиши <code>/code XXXXXX</code>",
         parse_mode="HTML", reply_markup=ckb()
     )
 
@@ -642,70 +478,41 @@ async def bulk_mode_cb(cb: CallbackQuery, state: FSMContext):
 async def bulk_run(m: Message, state: FSMContext):
     global _2fa_future
     if not g(m): return
-    d    = await state.get_data()
-    mode = d["mode"]
+    d     = await state.get_data()
+    mode  = d["mode"]
     lines = [l.strip() for l in m.text.strip().split("\n") if l.strip()]
     await state.clear()
 
     msg = await m.answer(
-        f"⚡ Запускаю {len(lines)} аккаунтов...\n"
-        f"При 2FA пишу сюда — ты вводишь <code>/code XXXXXX</code>",
+        f"⚡ Запускаю {len(lines)} аккаунтов...",
         parse_mode="HTML"
     )
     ok_list, fail_list = [], []
     min_p = 4 if mode == "both" else 3
 
     for i, line in enumerate(lines):
-        parts = line.split(":")
+        parts = line.split(":", 3)
         if len(parts) < min_p:
-            fail_list.append(f"❌ {line[:30]} — неверный формат"); continue
+            fail_list.append(f"❌ строка {i+1} — неверный формат"); continue
 
-        login    = parts[0].strip()
+        cookie   = parts[0].strip()
         password = parts[1].strip()
         arg1     = parts[2].strip()
         arg2     = parts[3].strip() if mode == "both" and len(parts) > 3 else ""
 
-        await msg.edit_text(f"⚡ [{i+1}/{len(lines)}] <code>{login}</code>...", parse_mode="HTML")
+        await msg.edit_text(f"⚡ [{i+1}/{len(lines)}] Аккаунт {i+1}...", parse_mode="HTML")
 
         try:
-            s  = mk_session()
-            lg = await rbx_login(s, login, password)
-
-            # 2FA — ждём код от тебя
-            if lg.get("need2fa"):
-                fa_csrf   = lg["csrf"]
-                fa_ticket = lg["ticket"]
-                fa_media  = lg["media"]
-
-                # Показываем сообщение и ждём /code
-                _2fa_future = asyncio.get_running_loop().create_future()
-                await msg.edit_text(
-                    f"🔐 <b>2FA на аккаунте</b> <code>{login}</code>\n"
-                    f"Тип: {fa_media}\n\n"
-                    f"Roblox отправил код — введи его:\n<code>/code 123456</code>\n\n"
-                    f"⏳ Жду 120 сек...",
-                    parse_mode="HTML"
-                )
-                try:
-                    code = await asyncio.wait_for(asyncio.shield(_2fa_future), timeout=120)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    _2fa_future = None
-                    fail_list.append(f"❌ {login} — 2FA таймаут"); await s.close(); continue
-
-                _2fa_future = None
-                await msg.edit_text(f"⚡ [{i+1}/{len(lines)}] <code>{login}</code> — проверяем 2FA...",
-                                    parse_mode="HTML")
-                # verify2fa в ТОЙ ЖЕ сессии s — ticket не требует старых кук
-                lg = await rbx_verify2fa(s, fa_csrf, fa_ticket, code, fa_media)
-                if "error" in lg:
-                    fail_list.append(f"❌ {login} — 2FA ошибка: {errmsg(lg)}")
-                    await s.close(); continue
-
-            if "error" in lg:
-                fail_list.append(f"❌ {login} — {errmsg(lg)}")
+            s    = mk_session(cookie)
+            auth = await rbx_check_auth(s)
+            if "error" in auth:
+                fail_list.append(f"❌ аккаунт {i+1} — {errmsg(auth)}")
                 await s.close(); continue
 
-            csrf   = lg["csrf"]
+            name = auth["name"]
+            await msg.edit_text(f"⚡ [{i+1}/{len(lines)}] <code>{name}</code>...", parse_mode="HTML")
+
+            csrf   = await get_csrf(s)
             result = {"ok": True}
 
             if mode in ("pass", "both"):
@@ -718,13 +525,13 @@ async def bulk_run(m: Message, state: FSMContext):
 
             await s.close()
             if is_ok(result):
-                ok_list.append(f"✅ {login}")
+                ok_list.append(f"✅ {name}")
             else:
-                fail_list.append(f"❌ {login} — {errmsg(result)}")
+                fail_list.append(f"❌ {name} — {errmsg(result)}")
 
         except Exception as e:
-            log.error(f"bulk error {login}: {e}")
-            fail_list.append(f"❌ {login} — {e}")
+            log.error(f"bulk error #{i+1}: {e}")
+            fail_list.append(f"❌ аккаунт {i+1} — {e}")
             try: await s.close()
             except: pass
 
