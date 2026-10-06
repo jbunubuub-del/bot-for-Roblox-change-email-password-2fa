@@ -262,41 +262,47 @@ async def rbx_disable_2fa(ctx, csrf):
 
 async def rbx_forgot_password(identifier: str) -> dict:
     """
-    Сброс пароля: сначала пробуем через API с правильным CSRF,
-    если не получается — даём прямую ссылку.
+    Сброс пароля через реальную страницу Chromium.
+    Заполняем форму как обычный пользователь — CSRF не нужен.
     """
     ctx  = await mk_context()
     page = await ctx.new_page()
     try:
-        # Загружаем главную чтобы получить валидный CSRF
-        await page.goto("https://www.roblox.com", wait_until="domcontentloaded", timeout=20000)
-        await page.close()
-
-        csrf = await get_csrf(ctx)
-        log.info(f"forgot csrf={'ok:'+csrf[:10] if csrf else 'EMPTY'}")
-
-        if not csrf:
-            return {"error": "no_csrf"}
-
-        t = "Email" if "@" in identifier else "Username"
-        r = await ctx.request.post(
-            "https://auth.roblox.com/v2/passwords/reset/send",
-            data={"targetType": t, "target": identifier},
-            headers={"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"},
+        log.info(f"forgot_password: navigating for {identifier}")
+        await page.goto(
+            "https://www.roblox.com/login/forgot-password-or-username",
+            wait_until="domcontentloaded", timeout=30000
         )
-        try: body = await r.json()
-        except: body = {}
-        log.info(f"forgot_pass API: status={r.status} body={body}")
+        await page.wait_for_timeout(2000)
 
-        if r.status == 200:
-            return {"ok": True}
+        # Находим поле ввода (email или username)
+        input_sel = "input[type='email'], input[type='text'], input[name*='email'], input[name*='username'], input[placeholder*='@'], input[placeholder*='Email'], input[placeholder*='Username']"
+        try:
+            await page.wait_for_selector(input_sel, timeout=8000)
+            await page.fill(input_sel, identifier)
+            log.info(f"filled input with {identifier}")
+        except Exception as e:
+            log.warning(f"input not found: {e}")
 
-        errs = body.get("errors") or [{}]
-        err_msg = errs[0].get("message") or f"HTTP {r.status}"
-        return {"error": err_msg}
+        await page.wait_for_timeout(500)
+
+        # Кликаем кнопку Submit
+        btn_sel = "button[type='submit'], button.btn-primary, button:has-text('Submit'), button:has-text('Send')"
+        try:
+            await page.wait_for_selector(btn_sel, timeout=5000)
+            await page.click(btn_sel)
+            log.info("clicked submit")
+        except Exception as e:
+            log.warning(f"submit button not found: {e}")
+            # Пробуем нажать Enter
+            await page.keyboard.press("Enter")
+
+        await page.wait_for_timeout(3000)
+        log.info("forgot_password: done")
+        return {"ok": True}
 
     except Exception as e:
-        log.error(f"forgot_password error: {e}")
+        log.error(f"forgot_password page error: {e}")
         return {"error": str(e)}
     finally:
         try: await page.close()
@@ -435,14 +441,20 @@ async def forgot_run(m: Message, state: FSMContext):
     if not g(m): return
     idf = m.text.strip()
     msg = await m.answer("⏳ Отправляем...")
-    r   = await rbx_forgot_password(idf)
+    r    = await rbx_forgot_password(idf)
     await state.clear()
     link = f"https://www.roblox.com/login/forgot-password-or-username?identifier={idf}"
     if is_ok(r):
-        await msg.edit_text(f"✅ <b>Письмо отправлено!</b>\nСсылка: {link}",
-                            parse_mode="HTML", reply_markup=menu())
+        await msg.edit_text(
+            f"✅ <b>Запрос отправлен!</b>\n\n"
+            f"📧 Проверь почту привязанную к <code>{idf}</code>\n\n"
+            f"Или открой вручную:\n{link}",
+            parse_mode="HTML", reply_markup=menu())
     else:
-        await msg.edit_text(f"⚠️ {err(r)}\n\nВручную: {link}", reply_markup=menu())
+        await msg.edit_text(
+            f"⚠️ {err(r)}\n\n"
+            f"Открой вручную (работает в браузере):\n{link}",
+            reply_markup=menu())
 
 # ══ 📧 СМЕНА ПОЧТЫ ═══════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_email")
