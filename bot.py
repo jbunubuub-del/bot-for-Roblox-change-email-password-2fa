@@ -113,45 +113,49 @@ async def solve_capguru(public_key: str, action_type: str) -> str | None:
                 return None
     return None
 
-async def handle_challenge(r, ctx: BrowserContext, csrf: str,
+async def handle_challenge(r, body: dict, ctx: BrowserContext, csrf: str,
                             method: str, url: str, payload: dict) -> dict:
     """
-    Если ответ 403 с challenge — решаем через CapSolver и повторяем запрос.
+    Решаем Roblox challenge через cap.guru и повторяем запрос.
+    body уже прочитан снаружи — не читаем повторно.
     """
-    challenge_id       = r.headers.get("rblx-challenge-id", "")
-    challenge_type     = r.headers.get("rblx-challenge-type", "")
-    challenge_metadata = r.headers.get("rblx-challenge-metadata", "")
-    log.info(f"Challenge: id={challenge_id} type={challenge_type}")
+    # Заголовки challenge (Playwright отдаёт их в нижнем регистре)
+    hdrs           = {k.lower(): v for k, v in r.headers.items()}
+    challenge_id   = hdrs.get("rblx-challenge-id", "")
+    challenge_type = hdrs.get("rblx-challenge-type", "captcha")
+    challenge_meta = hdrs.get("rblx-challenge-metadata", "")
+    log.info(f"Challenge headers: id={challenge_id!r} type={challenge_type!r} meta_len={len(challenge_meta)}")
+    log.info(f"All headers: {dict(hdrs)}")
 
-    if not challenge_id or challenge_type != "captcha":
-        try: body = await r.json()
-        except: body = {}
+    if not challenge_id:
+        # Нет заголовков — просто возвращаем ошибку из тела
         errs = body.get("errors") or [{}]
         return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
 
     if not CAPGURU_KEY:
-        return {"error": "Roblox требует капчу. Добавь CAPGURU_KEY в переменные Railway.\n"
-                         "API ключ берёшь на cap.guru"}
+        return {"error": "Roblox требует капчу!\nДобавь CAPGURU_KEY в переменные Railway.\nАPI ключ на cap.guru"}
 
-    # Декодируем metadata
+    # Декодируем base64 metadata с правильным padding
     try:
-        meta = json.loads(base64.b64decode(challenge_metadata + "==").decode())
+        pad  = (4 - len(challenge_meta) % 4) % 4
+        meta = json.loads(base64.b64decode(challenge_meta + "=" * pad).decode())
+        log.info(f"Challenge meta decoded: {meta}")
     except Exception as e:
-        log.error(f"metadata decode error: {e}")
-        meta = {}
+        log.error(f"metadata decode error: {e} raw={challenge_meta!r}")
+        return {"error": f"Не удалось декодировать challenge metadata: {e}"}
 
     public_key  = meta.get("unifiedCaptchaId", "")
     action_type = meta.get("actionType", "")
 
     if not public_key:
-        return {"error": f"Нет unifiedCaptchaId в challenge metadata: {meta}"}
+        return {"error": f"Нет unifiedCaptchaId: {meta}"}
 
-    # Решаем капчу
+    # Решаем через cap.guru
     token = await solve_capguru(public_key, action_type)
     if not token:
-        return {"error": "cap.guru не смог решить капчу. Проверь API ключ и баланс на сайте."}
+        return {"error": "cap.guru не решил капчу — проверь баланс и API ключ"}
 
-    # Формируем solution metadata
+    # Собираем solution metadata
     solution_meta = base64.b64encode(json.dumps({
         "unifiedCaptchaId": public_key,
         "captchaToken":     token,
@@ -159,15 +163,15 @@ async def handle_challenge(r, ctx: BrowserContext, csrf: str,
     }).encode()).decode()
 
     # Повторяем запрос с решением
-    extra_headers = {
-        "X-CSRF-TOKEN":         csrf,
-        "Content-Type":         "application/json",
+    retry_headers = {
+        "X-CSRF-TOKEN":            csrf,
+        "Content-Type":            "application/json",
         "rblx-challenge-id":       challenge_id,
         "rblx-challenge-type":     "captcha",
         "rblx-challenge-metadata": solution_meta,
     }
-    fn = getattr(ctx.request, method)
-    r2 = await fn(url, data=payload, headers=extra_headers)
+    fn  = getattr(ctx.request, method)
+    r2  = await fn(url, data=payload, headers=retry_headers)
     try: body2 = await r2.json()
     except: body2 = {}
     log.info(f"retry after challenge: status={r2.status} body={body2}")
@@ -181,33 +185,55 @@ async def rbx_request(ctx: BrowserContext, method: str,
     headers = {"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"}
     fn      = getattr(ctx.request, method)
     r       = await fn(url, data=payload, headers=headers)
-    try: body = await r.json()
-    except: body = {}
+
+    # Читаем тело ОДИН РАЗ здесь
+    try:
+        body = await r.json()
+    except Exception as e:
+        body = {}
+        log.warning(f"JSON parse error: {e} status={r.status}")
+
     log.info(f"rbx_request {method.upper()} {url}: status={r.status} body={body}")
-    if r.status == 200: return {"ok": True}
+
+    if r.status == 200:
+        return {"ok": True}
+
     if r.status == 403:
         errs = body.get("errors") or [{}]
         msg  = errs[0].get("message", "")
-        if "Challenge" in msg or r.headers.get("rblx-challenge-id"):
-            return await handle_challenge(r, ctx, csrf, method, url, payload)
+        hdrs = {k.lower(): v for k, v in r.headers.items()}
+        if "Challenge" in msg or hdrs.get("rblx-challenge-id"):
+            # Передаём уже прочитанный body — не читаем повторно
+            return await handle_challenge(r, body, ctx, csrf, method, url, payload)
+
     errs = body.get("errors") or [{}]
     return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
 
 # ── Roblox API ────────────────────────────────────────────────────────────────
 async def rbx_check_auth(ctx: BrowserContext) -> dict:
+    # Попытка 1: users API
     try:
         r = await ctx.request.get("https://users.roblox.com/v1/users/authenticated")
-        body = await r.json()
-        log.info(f"check_auth: status={r.status} body={body}")
+        try: body = await r.json()
+        except: body = {}
+        log.info(f"check_auth users: status={r.status} body={body}")
         if r.status == 200 and body.get("id"):
             return {"ok": True, "name": body.get("name","?"), "id": body["id"]}
-        r2   = await ctx.request.get("https://www.roblox.com/mobileapi/userinfo")
-        body2= await r2.json()
+    except Exception as e:
+        log.error(f"check_auth users error: {e}")
+
+    # Попытка 2: mobileapi
+    try:
+        r2 = await ctx.request.get("https://www.roblox.com/mobileapi/userinfo")
+        try: body2 = await r2.json()
+        except: body2 = {}
+        log.info(f"check_auth mobile: status={r2.status} body={body2}")
         if r2.status == 200 and body2.get("UserID"):
             return {"ok": True, "name": body2.get("UserName","?"), "id": body2["UserID"]}
-        return {"error": f"Cookie не валид (HTTP {r.status}) — возьми свежий из браузера"}
+        return {"error": "Cookie не валид или устарел — возьми свежий из браузера (F12 → Application → Cookies)"}
     except Exception as e:
-        return {"error": str(e)}
+        log.error(f"check_auth mobile error: {e}")
+        return {"error": f"Ошибка сети: {e}"}
 
 async def rbx_change_password(ctx, csrf, cur, new):
     return await rbx_request(ctx, "post",
@@ -235,14 +261,46 @@ async def rbx_disable_2fa(ctx, csrf):
         {}, csrf)
 
 async def rbx_forgot_password(identifier: str) -> dict:
-    ctx = await mk_context()
+    """
+    Сброс пароля: сначала пробуем через API с правильным CSRF,
+    если не получается — даём прямую ссылку.
+    """
+    ctx  = await mk_context()
+    page = await ctx.new_page()
     try:
+        # Загружаем главную чтобы получить валидный CSRF
+        await page.goto("https://www.roblox.com", wait_until="domcontentloaded", timeout=20000)
+        await page.close()
+
         csrf = await get_csrf(ctx)
-        return await rbx_request(ctx, "post",
+        log.info(f"forgot csrf={'ok:'+csrf[:10] if csrf else 'EMPTY'}")
+
+        if not csrf:
+            return {"error": "no_csrf"}
+
+        t = "Email" if "@" in identifier else "Username"
+        r = await ctx.request.post(
             "https://auth.roblox.com/v2/passwords/reset/send",
-            {"targetType": "Email" if "@" in identifier else "Username", "target": identifier},
-            csrf)
+            data={"targetType": t, "target": identifier},
+            headers={"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"},
+        )
+        try: body = await r.json()
+        except: body = {}
+        log.info(f"forgot_pass API: status={r.status} body={body}")
+
+        if r.status == 200:
+            return {"ok": True}
+
+        errs = body.get("errors") or [{}]
+        err_msg = errs[0].get("message") or f"HTTP {r.status}"
+        return {"error": err_msg}
+
+    except Exception as e:
+        log.error(f"forgot_password error: {e}")
+        return {"error": str(e)}
     finally:
+        try: await page.close()
+        except: pass
         await ctx.close()
 
 # ── States ────────────────────────────────────────────────────────────────────
