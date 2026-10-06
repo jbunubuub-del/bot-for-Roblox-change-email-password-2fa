@@ -1,4 +1,5 @@
-import os, asyncio, logging
+import os, asyncio, logging, base64, json
+import aiohttp
 from playwright.async_api import async_playwright, Browser, BrowserContext
 
 from aiogram import Bot, Dispatcher, F
@@ -11,13 +12,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-TOKEN    = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+TOKEN         = os.getenv("BOT_TOKEN", "")
+OWNER_ID      = int(os.getenv("OWNER_ID", "0"))
+CAPGURU_KEY = os.getenv("CAPGURU_KEY", "")   # API ключ с cap.guru
 
 bot = Bot(token=TOKEN)
 dp  = Dispatcher(storage=MemoryStorage())
 
-# ── Глобальный Playwright браузер (создаётся один раз) ────────────────────────
+# ── Playwright браузер ────────────────────────────────────────────────────────
 _pw      = None
 _browser: Browser | None = None
 
@@ -30,45 +32,168 @@ async def get_browser() -> Browser:
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         )
-        log.info("Chromium запущен!")
+        log.info("Chromium готов!")
     return _browser
 
 async def mk_context(cookie: str = "") -> BrowserContext:
-    """Создаём изолированный контекст браузера с нужным cookie."""
     browser = await get_browser()
     ctx = await browser.new_context(
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
         locale="en-US",
         timezone_id="America/New_York",
     )
     if cookie:
         val = cookie.strip().strip('"').strip("'")
         await ctx.add_cookies([{
-            "name":     ".ROBLOSECURITY",
-            "value":    val,
-            "domain":   ".roblox.com",
-            "path":     "/",
-            "httpOnly": True,
-            "secure":   True,
-            "sameSite": "None",
+            "name": ".ROBLOSECURITY", "value": val,
+            "domain": ".roblox.com",  "path":   "/",
+            "httpOnly": True, "secure": True, "sameSite": "None",
         }])
         log.info(f"Cookie установлен: len={len(val)} start={val[:25]!r}")
     return ctx
 
 async def get_csrf(ctx: BrowserContext) -> str:
-    """CSRF через logout endpoint."""
     try:
         r = await ctx.request.post("https://auth.roblox.com/v2/logout")
         csrf = r.headers.get("x-csrf-token", "")
         log.info(f"CSRF: {'ok' if csrf else 'EMPTY'} status={r.status}")
         return csrf
     except Exception as e:
-        log.error(f"get_csrf error: {e}")
+        log.error(f"get_csrf: {e}")
         return ""
 
-# ── Roblox API через Playwright request (реальный браузер, нет CORS) ──────────
+# ── CapSolver — решение FunCaptcha от Roblox ─────────────────────────────────
+async def solve_capguru(public_key: str, action_type: str) -> str | None:
+    """
+    Решаем FunCaptcha через cap.guru (2captcha-совместимый API).
+    Возвращает токен или None при ошибке.
+    """
+    if not CAPGURU_KEY:
+        log.warning("CAPGURU_KEY не задан!")
+        return None
+    log.info(f"cap.guru: решаем FunCaptcha key={public_key[:20]}...")
+    async with aiohttp.ClientSession() as s:
+        # 1. Создаём задачу через in.php
+        async with s.post("https://cap.guru/in.php", data={
+            "key":       CAPGURU_KEY,
+            "method":    "funcaptcha",
+            "publickey": public_key,
+            "pageurl":   "https://www.roblox.com",
+            "json":      "1",
+        }) as r:
+            data = await r.json(content_type=None)
+        log.info(f"cap.guru createTask: {data}")
+        if data.get("status") != 1:
+            log.error(f"cap.guru error: {data.get('request')}")
+            return None
+        task_id = data["request"]
+        log.info(f"cap.guru task_id={task_id}")
 
+        # 2. Ждём решения — опрашиваем res.php (до 3 минут)
+        for attempt in range(60):
+            await asyncio.sleep(3)
+            async with s.get("https://cap.guru/res.php", params={
+                "key":    CAPGURU_KEY,
+                "action": "get",
+                "id":     task_id,
+                "json":   "1",
+            }) as r:
+                result = await r.json(content_type=None)
+            log.info(f"cap.guru attempt {attempt+1}: {result}")
+            req = result.get("request", "")
+            if result.get("status") == 1:
+                log.info("cap.guru: капча решена!")
+                return req
+            if req not in ("CAPCHA_NOT_READY", "CAPTCHA_NOT_READY"):
+                log.error(f"cap.guru unexpected: {result}")
+                return None
+    return None
+
+async def handle_challenge(r, ctx: BrowserContext, csrf: str,
+                            method: str, url: str, payload: dict) -> dict:
+    """
+    Если ответ 403 с challenge — решаем через CapSolver и повторяем запрос.
+    """
+    challenge_id       = r.headers.get("rblx-challenge-id", "")
+    challenge_type     = r.headers.get("rblx-challenge-type", "")
+    challenge_metadata = r.headers.get("rblx-challenge-metadata", "")
+    log.info(f"Challenge: id={challenge_id} type={challenge_type}")
+
+    if not challenge_id or challenge_type != "captcha":
+        try: body = await r.json()
+        except: body = {}
+        errs = body.get("errors") or [{}]
+        return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
+
+    if not CAPGURU_KEY:
+        return {"error": "Roblox требует капчу. Добавь CAPGURU_KEY в переменные Railway.\n"
+                         "API ключ берёшь на cap.guru"}
+
+    # Декодируем metadata
+    try:
+        meta = json.loads(base64.b64decode(challenge_metadata + "==").decode())
+    except Exception as e:
+        log.error(f"metadata decode error: {e}")
+        meta = {}
+
+    public_key  = meta.get("unifiedCaptchaId", "")
+    action_type = meta.get("actionType", "")
+
+    if not public_key:
+        return {"error": f"Нет unifiedCaptchaId в challenge metadata: {meta}"}
+
+    # Решаем капчу
+    token = await solve_capguru(public_key, action_type)
+    if not token:
+        return {"error": "cap.guru не смог решить капчу. Проверь API ключ и баланс на сайте."}
+
+    # Формируем solution metadata
+    solution_meta = base64.b64encode(json.dumps({
+        "unifiedCaptchaId": public_key,
+        "captchaToken":     token,
+        "actionType":       action_type,
+    }).encode()).decode()
+
+    # Повторяем запрос с решением
+    extra_headers = {
+        "X-CSRF-TOKEN":         csrf,
+        "Content-Type":         "application/json",
+        "rblx-challenge-id":       challenge_id,
+        "rblx-challenge-type":     "captcha",
+        "rblx-challenge-metadata": solution_meta,
+    }
+    fn = getattr(ctx.request, method)
+    r2 = await fn(url, data=payload, headers=extra_headers)
+    try: body2 = await r2.json()
+    except: body2 = {}
+    log.info(f"retry after challenge: status={r2.status} body={body2}")
+    if r2.status == 200: return {"ok": True}
+    errs = body2.get("errors") or [{}]
+    return {"error": errs[0].get("message") or f"HTTP {r2.status}: {body2}"}
+
+async def rbx_request(ctx: BrowserContext, method: str,
+                       url: str, payload: dict, csrf: str) -> dict:
+    """Универсальный запрос к Roblox API с автоматическим решением капчи."""
+    headers = {"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"}
+    fn      = getattr(ctx.request, method)
+    r       = await fn(url, data=payload, headers=headers)
+    try: body = await r.json()
+    except: body = {}
+    log.info(f"rbx_request {method.upper()} {url}: status={r.status} body={body}")
+    if r.status == 200: return {"ok": True}
+    if r.status == 403:
+        errs = body.get("errors") or [{}]
+        msg  = errs[0].get("message", "")
+        if "Challenge" in msg or r.headers.get("rblx-challenge-id"):
+            return await handle_challenge(r, ctx, csrf, method, url, payload)
+    errs = body.get("errors") or [{}]
+    return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
+
+# ── Roblox API ────────────────────────────────────────────────────────────────
 async def rbx_check_auth(ctx: BrowserContext) -> dict:
     try:
         r = await ctx.request.get("https://users.roblox.com/v1/users/authenticated")
@@ -76,118 +201,61 @@ async def rbx_check_auth(ctx: BrowserContext) -> dict:
         log.info(f"check_auth: status={r.status} body={body}")
         if r.status == 200 and body.get("id"):
             return {"ok": True, "name": body.get("name","?"), "id": body["id"]}
-        # Fallback
-        r2 = await ctx.request.get("https://www.roblox.com/mobileapi/userinfo")
-        b2 = await r2.json()
-        log.info(f"check_auth mobileapi: status={r2.status} body={b2}")
-        if r2.status == 200 and b2.get("UserID"):
-            return {"ok": True, "name": b2.get("UserName","?"), "id": b2["UserID"]}
+        r2   = await ctx.request.get("https://www.roblox.com/mobileapi/userinfo")
+        body2= await r2.json()
+        if r2.status == 200 and body2.get("UserID"):
+            return {"ok": True, "name": body2.get("UserName","?"), "id": body2["UserID"]}
         return {"error": f"Cookie не валид (HTTP {r.status}) — возьми свежий из браузера"}
     except Exception as e:
-        log.error(f"check_auth error: {e}")
         return {"error": str(e)}
 
-async def rbx_change_password(ctx: BrowserContext, csrf: str,
-                               cur: str, new: str) -> dict:
-    r = await ctx.request.post(
+async def rbx_change_password(ctx, csrf, cur, new):
+    return await rbx_request(ctx, "post",
         "https://auth.roblox.com/v2/user/passwords/change",
-        data={"currentPassword": cur, "newPassword": new},
-        headers={"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"},
-    )
-    try: body = await r.json()
-    except: body = {}
-    log.info(f"change_pass: status={r.status} body={body}")
-    if r.status == 200: return {"ok": True}
-    errs = body.get("errors") or [{}]
-    return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
+        {"currentPassword": cur, "newPassword": new}, csrf)
 
-async def rbx_change_email(ctx: BrowserContext, csrf: str,
-                            email: str, password: str) -> dict:
-    r = await ctx.request.patch(
+async def rbx_change_email(ctx, csrf, email, password):
+    return await rbx_request(ctx, "patch",
         "https://accountsettings.roblox.com/v1/email",
-        data={"emailAddress": email, "password": password},
-        headers={"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"},
-    )
-    try: body = await r.json()
-    except: body = {}
-    log.info(f"change_email: status={r.status} body={body}")
-    if r.status == 200: return {"ok": True}
-    errs = body.get("errors") or [{}]
-    return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
+        {"emailAddress": email, "password": password}, csrf)
 
-async def rbx_add_2fa_email(ctx: BrowserContext, csrf: str, email: str) -> dict:
-    r = await ctx.request.post(
+async def rbx_add_2fa_email(ctx, csrf, email):
+    return await rbx_request(ctx, "post",
         "https://twostepverification.roblox.com/v1/users/current/configuration/email/enable",
-        data={"emailAddress": email},
-        headers={"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"},
-    )
-    try: body = await r.json()
-    except: body = {}
-    log.info(f"add_2fa: status={r.status} body={body}")
-    if r.status == 200: return {"ok": True}
-    errs = body.get("errors") or [{}]
-    return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
+        {"emailAddress": email}, csrf)
 
-async def rbx_verify_2fa_email(ctx: BrowserContext, csrf: str, code: str) -> dict:
-    r = await ctx.request.post(
+async def rbx_verify_2fa_email(ctx, csrf, code):
+    return await rbx_request(ctx, "post",
         "https://twostepverification.roblox.com/v1/users/current/configuration/email/verify",
-        data={"code": code},
-        headers={"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"},
-    )
-    try: body = await r.json()
-    except: body = {}
-    log.info(f"verify_2fa: status={r.status} body={body}")
-    if r.status == 200: return {"ok": True}
-    errs = body.get("errors") or [{}]
-    return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
+        {"code": code}, csrf)
 
-async def rbx_disable_2fa(ctx: BrowserContext, csrf: str) -> dict:
-    r = await ctx.request.delete(
+async def rbx_disable_2fa(ctx, csrf):
+    return await rbx_request(ctx, "delete",
         "https://twostepverification.roblox.com/v1/users/current/configuration",
-        headers={"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"},
-    )
-    try: body = await r.json()
-    except: body = {}
-    log.info(f"disable_2fa: status={r.status} body={body}")
-    if r.status == 200: return {"ok": True}
-    errs = body.get("errors") or [{}]
-    return {"error": errs[0].get("message") or f"HTTP {r.status}: {body}"}
+        {}, csrf)
 
 async def rbx_forgot_password(identifier: str) -> dict:
     ctx = await mk_context()
     try:
         csrf = await get_csrf(ctx)
-        t = "Email" if "@" in identifier else "Username"
-        r = await ctx.request.post(
+        return await rbx_request(ctx, "post",
             "https://auth.roblox.com/v2/passwords/reset/send",
-            data={"targetType": t, "target": identifier},
-            headers={"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"},
-        )
-        try: body = await r.json()
-        except: body = {}
-        log.info(f"forgot: status={r.status} body={body}")
-        if r.status == 200: return {"ok": True}
-        errs = body.get("errors") or [{}]
-        return {"error": errs[0].get("message") or f"HTTP {r.status}"}
+            {"targetType": "Email" if "@" in identifier else "Username", "target": identifier},
+            csrf)
     finally:
         await ctx.close()
 
 # ── States ────────────────────────────────────────────────────────────────────
 class ChangePass(StatesGroup):
     s_cookie = State(); s_cur = State(); s_new = State()
-
 class ForgotPass(StatesGroup):
     s_id = State()
-
 class ChangeEmail(StatesGroup):
     s_cookie = State(); s_pass = State(); s_email = State()
-
 class Add2FA(StatesGroup):
     s_cookie = State(); s_email = State(); s_verify = State()
-
 class Del2FA(StatesGroup):
     s_cookie = State()
-
 class Bulk(StatesGroup):
     s_mode = State(); s_list = State()
 
@@ -200,8 +268,8 @@ COOKIE_HELP = (
     "🍪 <b>Как получить .ROBLOSECURITY cookie:</b>\n\n"
     "1. Открой <b>roblox.com</b> в Chrome\n"
     "2. Войди в аккаунт\n"
-    "3. <b>F12</b> → <b>Application</b> → <b>Cookies</b> → roblox.com\n"
-    "4. Найди <b>.ROBLOSECURITY</b> → дважды кликни на Value → Ctrl+A → Ctrl+C\n\n"
+    "3. F12 → <b>Application</b> → <b>Cookies</b> → roblox.com\n"
+    "4. <b>.ROBLOSECURITY</b> → дважды кликни Value → Ctrl+A → Ctrl+C\n\n"
     "Вставь сюда (начинается с <code>_|WARNING</code>):"
 )
 
@@ -225,9 +293,7 @@ def ckb():
         [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")]
     ])
 
-async def check_cookie_step(m: Message, state: FSMContext,
-                              next_state, next_text: str):
-    """Общая проверка cookie — используется во всех флоу."""
+async def cookie_check(m: Message, state: FSMContext, next_state, next_text: str) -> bool:
     cookie = m.text.strip().strip('"').strip("'")
     msg    = await m.answer("⏳ Проверяем cookie через Chromium...")
     ctx    = await mk_context(cookie)
@@ -248,18 +314,21 @@ async def check_cookie_step(m: Message, state: FSMContext,
 async def cmd_start(m: Message, state: FSMContext):
     if not g(m): return
     await state.clear()
-    await m.answer("👾 <b>Roblox Account Changer</b>\n\n"
-                   "🔵 Работает через <b>Chromium</b> — никаких проблем с cookie!\n\n"
-                   "Выбери действие:", reply_markup=menu(), parse_mode="HTML")
+    cap_status = "✅ задан" if CAPGURU_KEY else "❌ не задан (добавь CAPGURU_KEY)"
+    await m.answer(
+        f"👾 <b>Roblox Account Changer</b>\n\n"
+        f"🔵 Chromium: активен\n"
+        f"🧩 CapSolver: {cap_status}\n\n"
+        f"Выбери действие:",
+        reply_markup=menu(), parse_mode="HTML"
+    )
 
 @dp.callback_query(F.data == "cancel")
 async def on_cancel(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.message.edit_text("Отменено.", reply_markup=menu())
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  🔑 СМЕНА ПАРОЛЯ
-# ══════════════════════════════════════════════════════════════════════════════
+# ══ 🔑 СМЕНА ПАРОЛЯ ══════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_pass")
 async def pass_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(ChangePass.s_cookie)
@@ -268,7 +337,7 @@ async def pass_start(cb: CallbackQuery, state: FSMContext):
 @dp.message(ChangePass.s_cookie)
 async def pass_cookie(m: Message, state: FSMContext):
     if not g(m): return
-    await check_cookie_step(m, state, ChangePass.s_cur, "Текущий пароль:")
+    await cookie_check(m, state, ChangePass.s_cur, "Текущий пароль:")
 
 @dp.message(ChangePass.s_cur)
 async def pass_cur(m: Message, state: FSMContext):
@@ -283,23 +352,20 @@ async def pass_new(m: Message, state: FSMContext):
     new = m.text.strip()
     if len(new) < 8:
         await m.answer("❌ Минимум 8 символов!"); return
-    d   = await state.get_data()
-    msg = await m.answer("⏳ Меняем пароль через Chromium...")
+    d    = await state.get_data()
+    msg  = await m.answer("⏳ Меняем пароль... (если нужна капча — займёт до 1 мин)")
     ctx  = await mk_context(d["cookie"])
     csrf = await get_csrf(ctx)
     r    = await rbx_change_password(ctx, csrf, d["cur"], new)
     await ctx.close(); await state.clear()
     if is_ok(r):
-        await msg.edit_text(f"✅ <b>Пароль изменён!</b>\n"
-                            f"👤 <code>{d['username']}</code>\n"
-                            f"🔑 Новый: <code>{new}</code>",
-                            parse_mode="HTML", reply_markup=menu())
+        await msg.edit_text(
+            f"✅ <b>Пароль изменён!</b>\n👤 <code>{d['username']}</code>\n🔑 <code>{new}</code>",
+            parse_mode="HTML", reply_markup=menu())
     else:
         await msg.edit_text(f"❌ {err(r)}", reply_markup=menu())
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  🔓 СБРОС ПАРОЛЯ
-# ══════════════════════════════════════════════════════════════════════════════
+# ══ 🔓 СБРОС ПАРОЛЯ ══════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_forgot")
 async def forgot_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(ForgotPass.s_id)
@@ -310,7 +376,7 @@ async def forgot_start(cb: CallbackQuery, state: FSMContext):
 async def forgot_run(m: Message, state: FSMContext):
     if not g(m): return
     idf = m.text.strip()
-    msg = await m.answer("⏳ Отправляем запрос...")
+    msg = await m.answer("⏳ Отправляем...")
     r   = await rbx_forgot_password(idf)
     await state.clear()
     link = f"https://www.roblox.com/login/forgot-password-or-username?identifier={idf}"
@@ -320,9 +386,7 @@ async def forgot_run(m: Message, state: FSMContext):
     else:
         await msg.edit_text(f"⚠️ {err(r)}\n\nВручную: {link}", reply_markup=menu())
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  📧 СМЕНА ПОЧТЫ
-# ══════════════════════════════════════════════════════════════════════════════
+# ══ 📧 СМЕНА ПОЧТЫ ═══════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_email")
 async def email_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(ChangeEmail.s_cookie)
@@ -331,7 +395,7 @@ async def email_start(cb: CallbackQuery, state: FSMContext):
 @dp.message(ChangeEmail.s_cookie)
 async def email_cookie(m: Message, state: FSMContext):
     if not g(m): return
-    await check_cookie_step(m, state, ChangeEmail.s_pass, "Пароль аккаунта:")
+    await cookie_check(m, state, ChangeEmail.s_pass, "Пароль аккаунта:")
 
 @dp.message(ChangeEmail.s_pass)
 async def email_pass(m: Message, state: FSMContext):
@@ -345,22 +409,19 @@ async def email_new(m: Message, state: FSMContext):
     if not g(m): return
     new_email = m.text.strip()
     d    = await state.get_data()
-    msg  = await m.answer("⏳ Меняем почту через Chromium...")
+    msg  = await m.answer("⏳ Меняем почту... (если нужна капча — займёт до 1 мин)")
     ctx  = await mk_context(d["cookie"])
     csrf = await get_csrf(ctx)
     r    = await rbx_change_email(ctx, csrf, new_email, d["password"])
     await ctx.close(); await state.clear()
     if is_ok(r):
-        await msg.edit_text(f"✅ <b>Почта изменена!</b>\n"
-                            f"👤 <code>{d['username']}</code>\n"
-                            f"📧 <code>{new_email}</code>",
-                            parse_mode="HTML", reply_markup=menu())
+        await msg.edit_text(
+            f"✅ <b>Почта изменена!</b>\n👤 <code>{d['username']}</code>\n📧 <code>{new_email}</code>",
+            parse_mode="HTML", reply_markup=menu())
     else:
         await msg.edit_text(f"❌ {err(r)}", reply_markup=menu())
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  🔐 ДОБАВИТЬ 2FA
-# ══════════════════════════════════════════════════════════════════════════════
+# ══ 🔐 ДОБАВИТЬ 2FA ══════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_2fa_add")
 async def add2fa_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Add2FA.s_cookie)
@@ -369,14 +430,14 @@ async def add2fa_start(cb: CallbackQuery, state: FSMContext):
 @dp.message(Add2FA.s_cookie)
 async def a2_cookie(m: Message, state: FSMContext):
     if not g(m): return
-    await check_cookie_step(m, state, Add2FA.s_email, "📧 Почта для добавления в 2FA:")
+    await cookie_check(m, state, Add2FA.s_email, "📧 Почта для добавления в 2FA:")
 
 @dp.message(Add2FA.s_email)
 async def a2_email(m: Message, state: FSMContext):
     if not g(m): return
     fa_email = m.text.strip()
     d    = await state.get_data()
-    msg  = await m.answer("⏳ Добавляем 2FA через Chromium...")
+    msg  = await m.answer("⏳ Добавляем 2FA... (если нужна капча — займёт до 1 мин)")
     ctx  = await mk_context(d["cookie"])
     csrf = await get_csrf(ctx)
     r    = await rbx_add_2fa_email(ctx, csrf, fa_email)
@@ -405,9 +466,7 @@ async def a2_verify(m: Message, state: FSMContext):
     else:
         await msg.edit_text(f"❌ {err(r)}", reply_markup=menu())
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  🗑 УБРАТЬ 2FA
-# ══════════════════════════════════════════════════════════════════════════════
+# ══ 🗑 УБРАТЬ 2FA ═════════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_2fa_del")
 async def del2fa_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Del2FA.s_cookie)
@@ -417,7 +476,7 @@ async def del2fa_start(cb: CallbackQuery, state: FSMContext):
 async def d2_cookie(m: Message, state: FSMContext):
     if not g(m): return
     cookie = m.text.strip().strip('"').strip("'")
-    msg    = await m.answer("⏳ Проверяем и отключаем 2FA...")
+    msg    = await m.answer("⏳ Отключаем 2FA...")
     ctx    = await mk_context(cookie)
     auth   = await rbx_check_auth(ctx)
     if "error" in auth:
@@ -433,12 +492,7 @@ async def d2_cookie(m: Message, state: FSMContext):
     else:
         await msg.edit_text(f"❌ {err(r)}", reply_markup=menu())
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ⚡ МАССОВАЯ СМЕНА
-#  Формат: COOKIE:пароль:новый_пароль  (режим pass)
-#          COOKIE:пароль:новая_почта   (режим email)
-#          COOKIE:пароль:новый_пароль:новая_почта (режим both)
-# ══════════════════════════════════════════════════════════════════════════════
+# ══ ⚡ МАССОВАЯ СМЕНА ═════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_bulk")
 async def bulk_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(Bulk.s_mode)
@@ -458,9 +512,9 @@ async def bulk_mode_cb(cb: CallbackQuery, state: FSMContext):
     lbl = {"pass": "Пароль", "email": "Почта", "both": "Пароль + Почта"}
     await cb.message.edit_text(
         f"⚡ Режим: <b>{lbl[mode]}</b>\n\n"
-        f"Формат (каждый аккаунт с новой строки):\n"
-        f"<code>{fmt[mode]}</code>\n\n"
-        f"COOKIE = .ROBLOSECURITY из браузера",
+        f"Формат (каждый с новой строки):\n<code>{fmt[mode]}</code>\n\n"
+        f"COOKIE = .ROBLOSECURITY из браузера\n"
+        f"🧩 Капча решается автоматически через cap.guru",
         parse_mode="HTML", reply_markup=ckb()
     )
 
@@ -472,13 +526,11 @@ async def bulk_run(m: Message, state: FSMContext):
     lines = [l.strip() for l in m.text.strip().split("\n") if l.strip()]
     await state.clear()
 
-    msg = await m.answer(f"⚡ Запускаю {len(lines)} аккаунтов через Chromium...",
-                         parse_mode="HTML")
+    msg = await m.answer(f"⚡ Запускаю {len(lines)} аккаунтов...")
     ok_list, fail_list = [], []
     min_p = 4 if mode == "both" else 3
 
     for i, line in enumerate(lines):
-        # Делим только на 4 части максимум (cookie может содержать ":")
         parts = line.split(":", 3)
         if len(parts) < min_p:
             fail_list.append(f"❌ строка {i+1} — неверный формат"); continue
@@ -498,15 +550,12 @@ async def bulk_run(m: Message, state: FSMContext):
                 await ctx.close(); continue
 
             name = auth["name"]
-            await msg.edit_text(f"⚡ [{i+1}/{len(lines)}] <code>{name}</code>...",
-                                parse_mode="HTML")
-
+            await msg.edit_text(f"⚡ [{i+1}/{len(lines)}] <code>{name}</code>...", parse_mode="HTML")
             csrf   = await get_csrf(ctx)
             result = {"ok": True}
 
             if mode in ("pass", "both"):
                 result = await rbx_change_password(ctx, csrf, password, arg1)
-
             if is_ok(result) and mode in ("email", "both"):
                 em = arg2 if mode == "both" else arg1
                 pw = arg1 if mode == "both" else password
@@ -516,14 +565,13 @@ async def bulk_run(m: Message, state: FSMContext):
             else: fail_list.append(f"❌ {name} — {err(result)}")
 
         except Exception as e:
-            log.error(f"bulk #{i+1} error: {e}")
+            log.error(f"bulk #{i+1}: {e}")
             fail_list.append(f"❌ аккаунт {i+1} — {e}")
         finally:
             if ctx:
                 try: await ctx.close()
                 except: pass
-
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.8)
 
     rep = f"⚡ <b>Готово!</b> {len(ok_list)} ✅ / {len(fail_list)} ❌\n\n"
     if ok_list:   rep += "✅ <b>Успех:</b>\n"  + "\n".join(ok_list[:40])  + "\n\n"
@@ -532,10 +580,8 @@ async def bulk_run(m: Message, state: FSMContext):
 
 # ── main ──────────────────────────────────────────────────────────────────────
 async def main():
-    log.info(f"Bot started. OWNER_ID={OWNER_ID}")
-    # Прогреваем браузер при старте
+    log.info(f"Bot started. OWNER_ID={OWNER_ID} cap.guru={'yes' if CAPGURU_KEY else 'NO'}")
     await get_browser()
-    log.info("Chromium готов!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
