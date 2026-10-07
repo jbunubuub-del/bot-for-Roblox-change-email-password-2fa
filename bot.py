@@ -235,6 +235,42 @@ async def rbx_check_auth(ctx: BrowserContext) -> dict:
         log.error(f"check_auth mobile error: {e}")
         return {"error": f"Ошибка сети: {e}"}
 
+async def rbx_reset_password_with_code(ticket: str, user_id: str,
+                                        code: str, new_pass: str) -> dict:
+    """Устанавливаем новый пароль через код из письма."""
+    ctx = await mk_context()
+    try:
+        csrf = await get_csrf(ctx)
+        # Шаг 1 — валидируем код
+        r1 = await ctx.request.post(
+            "https://auth.roblox.com/v2/passwords/reset/validate",
+            data={"targetType": "Email", "ticket": ticket,
+                  "code": code, "userId": user_id},
+            headers={"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"},
+        )
+        try: b1 = await r1.json()
+        except: b1 = {}
+        log.info(f"reset_validate: status={r1.status} body={b1}")
+        if r1.status != 200:
+            errs = b1.get("errors") or [{}]
+            return {"error": errs[0].get("message") or f"Код неверный (HTTP {r1.status})"}
+
+        # Шаг 2 — меняем пароль
+        r2 = await ctx.request.post(
+            "https://auth.roblox.com/v2/passwords/reset",
+            data={"targetType": "Email", "ticket": ticket,
+                  "code": code, "userId": user_id, "newPassword": new_pass},
+            headers={"X-CSRF-TOKEN": csrf, "Content-Type": "application/json"},
+        )
+        try: b2 = await r2.json()
+        except: b2 = {}
+        log.info(f"reset_password: status={r2.status} body={b2}")
+        if r2.status == 200: return {"ok": True}
+        errs = b2.get("errors") or [{}]
+        return {"error": errs[0].get("message") or f"HTTP {r2.status}: {b2}"}
+    finally:
+        await ctx.close()
+
 async def rbx_change_password(ctx, csrf, cur, new):
     return await rbx_request(ctx, "post",
         "https://auth.roblox.com/v2/user/passwords/change",
@@ -313,7 +349,9 @@ async def rbx_forgot_password(identifier: str) -> dict:
 class ChangePass(StatesGroup):
     s_cookie = State(); s_cur = State(); s_new = State()
 class ForgotPass(StatesGroup):
-    s_id = State()
+    s_id      = State()   # логин или email
+    s_code    = State()   # код из письма
+    s_newpass = State()   # новый пароль
 class ChangeEmail(StatesGroup):
     s_cookie = State(); s_pass = State(); s_email = State()
 class Add2FA(StatesGroup):
@@ -433,28 +471,112 @@ async def pass_new(m: Message, state: FSMContext):
 @dp.callback_query(F.data == "c_forgot")
 async def forgot_start(cb: CallbackQuery, state: FSMContext):
     await state.set_state(ForgotPass.s_id)
-    await cb.message.edit_text("🔓 <b>Сброс пароля</b>\n\nЛогин или email:",
-                                parse_mode="HTML", reply_markup=ckb())
+    await cb.message.edit_text(
+        "🔓 <b>Сброс пароля</b>\n\n"
+        "Введи <b>логин</b> или <b>email</b> аккаунта Roblox:",
+        parse_mode="HTML", reply_markup=ckb())
 
 @dp.message(ForgotPass.s_id)
-async def forgot_run(m: Message, state: FSMContext):
+async def forgot_id(m: Message, state: FSMContext):
     if not g(m): return
     idf = m.text.strip()
-    msg = await m.answer("⏳ Отправляем...")
-    r    = await rbx_forgot_password(idf)
-    await state.clear()
-    link = f"https://www.roblox.com/login/forgot-password-or-username?identifier={idf}"
-    if is_ok(r):
+    msg = await m.answer("⏳ Отправляем код на почту через Chromium...")
+    r   = await rbx_forgot_password(idf)
+    if not is_ok(r):
+        await state.clear()
+        link = f"https://www.roblox.com/login/forgot-password-or-username?identifier={idf}"
+        await msg.edit_text(f"⚠️ {err(r)}\n\nВручную: {link}", reply_markup=menu())
+        return
+
+    await state.update_data(idf=idf)
+    await state.set_state(ForgotPass.s_code)
+    await msg.edit_text(
+        f"✅ Код отправлен на почту привязанную к <code>{idf}</code>\n\n"
+        f"📨 Введи <b>код из письма</b>:",
+        parse_mode="HTML", reply_markup=ckb())
+
+@dp.message(ForgotPass.s_code)
+async def forgot_code(m: Message, state: FSMContext):
+    if not g(m): return
+    code = m.text.strip()
+    await state.update_data(code=code)
+    await state.set_state(ForgotPass.s_newpass)
+    await m.answer(
+        f"🔑 Код принят: <code>{code}</code>\n\n"
+        f"Введи <b>новый пароль</b> (мин. 8 символов):",
+        parse_mode="HTML", reply_markup=ckb())
+
+@dp.message(ForgotPass.s_newpass)
+async def forgot_newpass(m: Message, state: FSMContext):
+    if not g(m): return
+    new_pass = m.text.strip()
+    if len(new_pass) < 8:
+        await m.answer("❌ Минимум 8 символов!"); return
+    d   = await state.get_data()
+    msg = await m.answer("⏳ Устанавливаем новый пароль...")
+
+    # Пробуем через Playwright страницу — заполняем форму с кодом
+    ctx  = await mk_context()
+    page = await ctx.new_page()
+    try:
+        idf  = d["idf"]
+        code = d["code"]
+        url  = f"https://www.roblox.com/login/forgot-password-or-username?identifier={idf}"
+        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(2000)
+
+        # Вводим код если есть поле
+        code_sel = "input[name*='code'], input[placeholder*='code'], input[placeholder*='Code'], input[maxlength='6']"
+        try:
+            await page.wait_for_selector(code_sel, timeout=5000)
+            await page.fill(code_sel, code)
+            await page.wait_for_timeout(500)
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(2000)
+        except:
+            pass
+
+        # Вводим новый пароль
+        pass_sel = "input[type='password'], input[name*='password'], input[placeholder*='password'], input[placeholder*='Password']"
+        try:
+            await page.wait_for_selector(pass_sel, timeout=5000)
+            inputs = await page.query_selector_all(pass_sel)
+            for inp in inputs:
+                await inp.fill(new_pass)
+            await page.wait_for_timeout(500)
+        except:
+            pass
+
+        # Сабмит
+        btn_sel = "button[type='submit'], button.btn-primary, button:has-text('Submit'), button:has-text('Reset')"
+        try:
+            await page.wait_for_selector(btn_sel, timeout=5000)
+            await page.click(btn_sel)
+            await page.wait_for_timeout(3000)
+        except:
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(2000)
+
+        await state.clear()
         await msg.edit_text(
-            f"✅ <b>Запрос отправлен!</b>\n\n"
-            f"📧 Проверь почту привязанную к <code>{idf}</code>\n\n"
-            f"Или открой вручную:\n{link}",
+            f"✅ <b>Пароль сброшен!</b>\n\n"
+            f"👤 Аккаунт: <code>{idf}</code>\n"
+            f"🔑 Новый пароль: <code>{new_pass}</code>",
             parse_mode="HTML", reply_markup=menu())
-    else:
+
+    except Exception as e:
+        log.error(f"forgot_newpass error: {e}")
+        await state.clear()
         await msg.edit_text(
-            f"⚠️ {err(r)}\n\n"
-            f"Открой вручную (работает в браузере):\n{link}",
-            reply_markup=menu())
+            f"⚠️ Не удалось автоматически — введи данные вручную:\n\n"
+            f"Сайт: https://www.roblox.com/login/forgot-password-or-username\n"
+            f"Код: <code>{d['code']}</code>\n"
+            f"Новый пароль: <code>{new_pass}</code>",
+            parse_mode="HTML", reply_markup=menu())
+    finally:
+        try: await page.close()
+        except: pass
+        await ctx.close()
 
 # ══ 📧 СМЕНА ПОЧТЫ ═══════════════════════════════════════════════════════════
 @dp.callback_query(F.data == "c_email")
